@@ -63,7 +63,7 @@ class GlacierOutlines(gu.Vector):
         pairs = self._overlapping_inds()
 
         if len(pairs) > 0:
-            overlap_gdf = self.get_overlaps(pairs)
+            overlap_gdf = self.get_overlaps()
 
             print(f"Found {len(pairs)} pairs of overlapping geometries.")
             print(f"Saving overlaps to errors/{output_prefix}_overlaps.gpkg for review.")
