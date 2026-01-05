@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
+import pandas as pd
 import geopandas as gpd
 import geoutils as gu
+from . import utils
 from typing import TypeVar, Union
 
 
@@ -25,6 +27,7 @@ class GlacierOutlines(gu.Vector):
 
        validate(): check whether the outlines have topological or other errors.
        get_overlaps(): return a Vector object with all areas where outlines overlap.
+       join_rgi(): join the outlines to RGI outlines
     """
     def __init__(self, *args, **kwargs):
         gu.Vector.__init__(self, *args, **kwargs)
@@ -106,7 +109,6 @@ class GlacierOutlines(gu.Vector):
         os.makedirs('cleaned', exist_ok=True)
         self.to_file(Path('cleaned', output_prefix + '.gpkg'))
 
-
     def get_overlaps(self) -> gu.Vector:
         """
         Find all overlapping geometries in the current set of outlines.
@@ -125,7 +127,6 @@ class GlacierOutlines(gu.Vector):
 
         return overlap_gdf.explode()
 
-
     def _overlapping_inds(self) -> list[tuple[int, int]]:
         overlaps = []
         overlap_inds = []
@@ -141,3 +142,73 @@ class GlacierOutlines(gu.Vector):
                         overlap_inds.append((ind, oind))
 
         return overlap_inds
+
+    def compute_difference(self, other: Union[GlacierOutlinesType, str, Path]) -> GlacierOutlinesType:
+        """
+        Compute the symmetric difference between the glacier outlines and another geometry, using the .union_all() of
+        each set of outlines. Output is a Vector with a single attribute, 'difference', with the following values:
+
+            - 'added': areas that are included in self but not in "other"
+            - 'removed': areas that are included in "other" but not in self
+
+        :param fn_update: the filename for the update vector file
+        :param other: the other outlines, or the filename for the other vector file
+        :return: the differenced geometries
+        """
+        if isinstance(other, (str, Path)):
+            other = gu.Vector(other).union_all()
+        else:
+            other = other.union_all()
+
+        update = self.union_all()
+
+        removed = other.difference(update).explode()
+        added = update.difference(other).explode()
+
+        removed['difference'] = 'removed'
+        added['difference'] = 'added'
+
+        return gu.Vector(pd.concat([added.ds, removed.ds], ignore_index=True))
+
+    def join_rgi(self,
+                 rgi_reg: Union[int, str, Path],
+                 rgi_dir: Union[str, Path] = 'rgi',
+                 version: str = 'v7.0',
+                 inplace: bool = False) -> Union[None, GlacierOutlinesType]:
+        """
+        Join the GlacierOutlines to overlapping RGI outlines. RGI outlines are first sub-sampled by intersecting with
+        the total boundary of the GlacierOutlines geometries. The sub-sampled RGI outlines are then converted to a
+        "representative point" before applying a spatial join to the GlacierOutlines geometries.
+
+        :param rgi_dir: The path to the directory where the RGI files or folders are stored.
+        :param rgi_reg: The RGI region name (e.g., RGI2000-v7.0-G-01_alaska) or number (e.g., 1 for region 01)
+        :param version: The RGI version (v7.0 or v6.0)
+        :param inplace: Whether to do the spatial join in-place, or create a new GlacierOutlines object.
+        :return:
+        """
+        rgi_outlines = gu.Vector(utils.rgi_loader(rgi_dir, rgi_reg=rgi_reg, version=version))
+        envelope = self.union_all().envelope.ds.loc[0, 'geometry']
+
+        reduced = rgi_outlines[rgi_outlines.ds.to_crs(self.crs).intersects(envelope)].copy().ds
+        reduced['geometry'] = reduced.to_crs(self.estimate_utm_crs()).representative_point().to_crs(self.crs)
+
+        rgi_centers = gu.Vector(reduced)
+
+        if inplace:
+            self.ds = self.sjoin(rgi_centers).ds
+            return None
+        else:
+            return self.sjoin(rgi_centers)
+
+    def reindex(self, prefix: Union[None, str] = None) -> None:
+        """
+        Re-index the GlacierOutlines.
+
+        :param prefix: a prefix to add to the index (e.g., "RGI60-01" or "LIA-01"). If not provided, defaults to the
+           row number of the GeoDataFrame.
+        """
+        if prefix is None:
+            self.ds.index = range(len(self.ds))
+        else:
+            ndigits = len(str(len(self.ds)))
+            self.ds.index = [f"{prefix}.{str(n+1).zfill(ndigits)}" for n in range(len(self.ds))]
