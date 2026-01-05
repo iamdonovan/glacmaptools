@@ -1,0 +1,10 @@
+name: gcmt
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python
+  - pandas
+  - geoutils
+  - jupyterlab
+  - pip
