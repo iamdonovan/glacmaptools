@@ -3,6 +3,7 @@ from pathlib import Path
 import pandas as pd
 import geopandas as gpd
 import geoutils as gu
+from shapely.geometry import Polygon
 from . import utils
 from typing import TypeVar, Union
 
@@ -31,6 +32,10 @@ class GlacierOutlines(gu.Vector):
     """
     def __init__(self, *args, **kwargs):
         gu.Vector.__init__(self, *args, **kwargs)
+
+    def total_envelope(self) -> Polygon:
+        "The total envelope of the outlines."
+        return self.union_all().envelope.ds.loc[0, 'geometry']
 
     def validate(self,
                  overlap_ok: bool = False,
@@ -143,7 +148,8 @@ class GlacierOutlines(gu.Vector):
 
         return overlap_inds
 
-    def compute_difference(self, other: Union[GlacierOutlinesType, str, Path]) -> GlacierOutlinesType:
+    def compute_difference(self, other: Union[GlacierOutlinesType, str, Path],
+                           filter: bool = True) -> GlacierOutlinesType:
         """
         Compute the symmetric difference between the glacier outlines and another geometry, using the .union_all() of
         each set of outlines. Output is a Vector with a single attribute, 'difference', with the following values:
@@ -153,13 +159,16 @@ class GlacierOutlines(gu.Vector):
 
         :param fn_update: the filename for the update vector file
         :param other: the other outlines, or the filename for the other vector file
+        :param filter: filter the other geometry using .filter_other() before differencing.
         :return: the differenced geometries
         """
         if isinstance(other, (str, Path)):
-            other = gu.Vector(other).union_all()
-        else:
-            other = other.union_all()
+            other = gu.Vector(other)
 
+        if filter:
+            other = self.filter_other(other)
+
+        other = other.union_all()
         update = self.union_all()
 
         removed = other.difference(update).explode()
@@ -169,6 +178,15 @@ class GlacierOutlines(gu.Vector):
         added['difference'] = 'added'
 
         return gu.Vector(pd.concat([added.ds, removed.ds], ignore_index=True))
+
+    def filter_other(self, other: GlacierOutlinesType) -> GlacierOutlinesType:
+        """
+        Filter another set of outlines by intersecting to self.total_envelope()
+
+        :param other: the other outlines.
+        :return: the other outlines, filtered to the intersection of the total bounds of self.
+        """
+        return other[other.ds.to_crs(self.crs).intersects(self.total_envelope())].copy()
 
     def join_other(self,
                    other: Union[GlacierOutlinesType, str, Path],
@@ -188,8 +206,7 @@ class GlacierOutlines(gu.Vector):
         if isinstance(other, (str, Path)):
             other = GlacierOutlines(other)
 
-        envelope = self.union_all().envelope.ds.loc[0, 'geometry']
-        reduced = other[other.ds.to_crs(self.crs).intersects(envelope)].copy().ds
+        reduced = self.filter_other(other)
         reduced['geometry'] = reduced.to_crs(self.estimate_utm_crs()).representative_point().to_crs(self.crs)
 
         if inplace:
@@ -231,3 +248,47 @@ class GlacierOutlines(gu.Vector):
         else:
             ndigits = len(str(len(self.ds)))
             self.ds.index = [f"{prefix}.{str(n+1).zfill(ndigits)}" for n in range(len(self.ds))]
+
+
+    def compute_area_changes(self,
+                             other,
+                             crs = None) -> GlacierOutlinesType:
+        """
+
+        :param other:
+        :param crs:
+        :return:
+        """
+        if isinstance(other, (str, Path)):
+            other = GlacierOutlines(other)
+
+        joined = self.join_other(other, inplace=False)
+
+        colnames = {'v7.0': {'id': 'rgi_id', 'area': 'area_km2'},
+                    'v6.0': {'id': 'RGIId', 'area': 'Area'}}
+
+        joined['rgi_inds'] = joined.ds.groupby(level=0)[colnames[version]['id']].transform(lambda x: ','.join(x)).drop_duplicates()
+        # get total RGI area for all glaciers within the LIA outline
+        joined['rgi_area'] = joined.ds.groupby(level=0)[colnames[version]['area']].sum()
+
+        # count how many RGI glaciers are included in each LIA outline
+        joined['n_rgi'] = joined.ds.index.value_counts()
+
+        # for now, defaulting to using Alaska Albers to compute area; easily changed
+        if crs is not None:
+            joined['lia_area'] = joined.to_crs(crs).geometry.area / 1e6
+        else:
+            joined['lia_area'] = joined.to_crs(joined.estimate_utm_crs()).geometry.area / 1e6
+
+        # calculate difference between LIA area and RGI area
+        joined['lia_rgi_diff'] = joined['lia_area'] - joined['rgi_area']
+
+        out_cols = ['self_area', 'other_area', 'difference', 'n_other', 'other_inds', 'geometry']
+
+        return joined[~joined.index.duplicated(keep='first')][out_cols]
+
+    def compute_rgi_area_changes(self,
+                                 rgi_reg: Union[int, str, Path],
+                                 rgi_dir: Union[str, Path] = 'rgi',
+                                 version: str = 'v7.0'):
+        pass
