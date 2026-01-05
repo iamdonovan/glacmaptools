@@ -1,0 +1,354 @@
+import os
+from pathlib import Path
+import pandas as pd
+import geopandas as gpd
+import geoutils as gu
+from shapely.geometry import Polygon
+from . import utils
+from typing import TypeVar, Union
+
+
+# This is a generic Vector-type (if subclasses are made, this will change appropriately)
+GlacierOutlinesType = TypeVar("GlacierOutlinesType", bound="GlacierOutlines")
+
+class GlacierOutlines(gu.Vector):
+    """
+    A vector geometry representing glacier outlines, based on geoutils.Vector.
+
+    Main attributes:
+       ds: :class:`geopandas.GeoDataFrame`
+           GeoDataFrame of the glacier outlines.
+       crs: :class:`pyproject.crs.CRS`
+           Coordinate reference system of the outlines.
+       bounds: :class:`rio.coords.BoundingBox`
+           Coordinate bounds of the outlines.
+
+    Methods added beyond attributes/methods inherited from geoutils.Vector:
+
+       validate(): check whether the outlines have topological or other errors.
+       get_overlaps(): return a Vector object with all areas where outlines overlap.
+       join_other(): spatially join the outlines to another set of outlines
+       join_rgi(): spatially join the outlines to RGI outlines
+    """
+    def __init__(self, *args, **kwargs):
+        gu.Vector.__init__(self, *args, **kwargs)
+
+    def total_envelope(self) -> Polygon:
+        "The total envelope of the outlines."
+        return self.union_all().envelope.ds.loc[0, 'geometry']
+
+    def validate(self,
+                 overlap_ok: bool = False,
+                 multi_ok: bool = False) -> None:
+        """
+        Checks the GlacierOutlines geometries for the following errors:
+
+        - overlapping geometries. If overlaps are allowed, use overlap_ok=True.
+        - multi-part geometries. If multi-part geometries are allowed, use multi_ok=True.
+        - invalid geometries (using self.is_valid)
+
+        By default, fails if any of the above checks fail. Once checks are passed, runs .remove_repeated_points() to
+        remove any repeated nodes (with a tolerance of 1e-6), then saves to the cleaned/ directory.
+
+        All errors (overlaps, multi-part geometries, invalid geometries) are saved to the errors/ directory for review.
+
+        :param overlap_ok: outlines are allowed to overlap.
+        :param multi_ok: outlines are allowed to be multi-part.
+        """
+        # run remove_repeated_points
+        # check for invalid geometries using is_valid
+        # - if invalid, give reason
+        # output a file with "errors" that indicate which geometries are the problem
+        output_prefix = os.path.splitext(os.path.basename(self.name))[0]
+
+        has_overlap = False
+        has_invalid = False
+
+        # check for overlaps
+        pairs = self._overlapping_inds()
+
+        if len(pairs) > 0:
+            overlap_gdf = self.get_overlaps()
+
+            print(f"Found {len(pairs)} pairs of overlapping geometries.")
+            print(f"Saving overlaps to errors/{output_prefix}_overlaps.gpkg for review.")
+            os.makedirs('errors', exist_ok=True)
+
+            overlap_gdf.to_file(Path('errors', output_prefix + '_overlaps.gpkg'))
+
+            if not overlap_ok:
+                has_overlap = True
+
+        # check validity
+        if not all(self.is_valid):
+            os.makedirs('errors', exist_ok=True)
+            has_invalid = True
+
+            print('Invalid geometries found.')
+            print(f"Saving invalid outlines to errors/{output_prefix}_invalid.gpkg for review.")
+            invalid = self.ds.loc[~self.is_valid]
+            invalid['reason'] = invalid.is_valid_reason()
+            invalid.to_file(Path('errors', output_prefix + '_invalid.gpkg'))
+
+        if not multi_ok:
+            has_multi = not len(self.ds) == len(self.ds.explode())
+            if has_multi:
+                print('MultiPolygon geometries found.')
+                print(f"Saving to errors/{output_prefix}_multi.gpkg for review.")
+
+                exploded = self.explode()
+                multiinds = exploded[exploded.ds.index.duplicated()].index.to_list()
+                self[self.ds.index.isin(multiinds)].to_file(Path('errors', output_prefix + '_multi.gpkg'))
+        else:
+            has_multi = False
+
+        # remove repeated points
+        cleaned_geom = self.ds.remove_repeated_points(tolerance=1e-6)
+        self['geometry'] = cleaned_geom
+
+        assert not any([has_overlap, has_invalid, has_multi]), "One or more checks failed."
+
+        print('All checks passed.')
+
+        print(f"Saving outlines to cleaned/{output_prefix}.gpkg")
+        os.makedirs('cleaned', exist_ok=True)
+        self.to_file(Path('cleaned', output_prefix + '.gpkg'))
+
+    def get_overlaps(self) -> gu.Vector:
+        """
+        Find all overlapping geometries in the current set of outlines.
+
+        :return: the overlapping geometries.
+        """
+        pairs = self._overlapping_inds()
+
+        geoms = []
+        for ind1, ind2 in pairs:
+            geoms.append(self.ds.loc[ind1, 'geometry'].intersection(self.ds.loc[ind2, 'geometry']))
+
+        left, right = zip(*pairs)
+        overlap_gdf = gu.Vector(gpd.GeoDataFrame(data={'geometry': geoms, 'ind1': left, 'ind2': right},
+                                                       crs=self.crs)).explode()
+
+        return overlap_gdf.explode()
+
+    def _overlapping_inds(self) -> list[tuple[int, int]]:
+        overlaps = []
+        overlap_inds = []
+
+        for n, ind in enumerate(self.index[:-1], 1):
+            poly = self.ds.loc[ind, 'geometry']
+            has_overlap = [g.overlaps(poly) for g in self.ds.loc[n + 1:, 'geometry']]
+
+            if any(has_overlap):
+                overlaps.append(ind)
+                for oind, row in self.ds.loc[n + 1:].iterrows():
+                    if row['geometry'].overlaps(poly):
+                        overlap_inds.append((ind, oind))
+
+        return overlap_inds
+
+    def labeled_difference(self, other: Union[GlacierOutlinesType, str, Path],
+                           filter: bool = True) -> GlacierOutlinesType:
+        """
+        Compute the symmetric difference between the glacier outlines and another geometry, using the .union_all() of
+        each set of outlines. Output is a Vector with a single attribute, 'difference', with the following values:
+
+            - 'added': areas that are included in self but not in "other"
+            - 'removed': areas that are included in "other" but not in self
+
+        :param fn_update: the filename for the update vector file
+        :param other: the other outlines, or the filename for the other vector file
+        :param filter: filter the other geometry using .filter_other() before differencing.
+        :return: the differenced geometries
+        """
+        if isinstance(other, (str, Path)):
+            other = gu.Vector(other)
+
+        if filter:
+            other = self.filter_other(other)
+
+        other = other.union_all()
+        update = self.union_all()
+
+        removed = other.difference(update).explode()
+        added = update.difference(other).explode()
+
+        removed['difference'] = 'removed'
+        added['difference'] = 'added'
+
+        return gu.Vector(pd.concat([added.ds, removed.ds], ignore_index=True))
+
+    def filter_other(self, other: GlacierOutlinesType) -> GlacierOutlinesType:
+        """
+        Filter another set of outlines by intersecting to self.total_envelope()
+
+        :param other: the other outlines.
+        :return: the other outlines, filtered to the intersection of the total bounds of self.
+        """
+        return other[other.ds.to_crs(self.crs).intersects(self.total_envelope())].copy()
+
+    def join_other(self,
+                   other: Union[GlacierOutlinesType, str, Path],
+                   inplace: bool = False,
+                   **kwargs) -> Union[None, GlacierOutlinesType]:
+
+        """
+        Join the GlacierOutlines to overlapping outlines. Other outlines are first sub-sampled by intersecting with
+        the total boundary of the GlacierOutlines geometries. The sub-sampled other outlines are then converted to a
+        "representative point" before applying a spatial join to the GlacierOutlines geometries.
+
+        :param other: the other outlines, or the filename for the other vector file
+        :param inplace: Whether to do the spatial join in-place, or create a new GlacierOutlines object.
+        :param kwargs: additional keyword arguments to pass to gpd.GeoDataFrame.sjoin
+        :return:
+        """
+        if isinstance(other, (str, Path)):
+            other = GlacierOutlines(other)
+
+        reduced = self.filter_other(other)
+        new_pts = reduced.to_crs(self.estimate_utm_crs()).representative_point().to_crs(self.crs).ds['geometry']
+        reduced['geometry'] = new_pts
+
+        if inplace:
+            self.ds = self.sjoin(reduced, **kwargs).ds
+            return None
+        else:
+            return self.sjoin(reduced, **kwargs)
+
+    def join_rgi(self,
+                 rgi_reg: Union[int, str, Path],
+                 rgi_dir: Union[str, Path] = 'rgi',
+                 version: str = 'v7.0',
+                 inplace: bool = False,
+                 **kwargs) -> Union[None, GlacierOutlinesType]:
+        """
+        Join the GlacierOutlines to overlapping RGI outlines. RGI outlines are first sub-sampled by intersecting with
+        the total boundary of the GlacierOutlines geometries. The sub-sampled RGI outlines are then converted to a
+        "representative point" before applying a spatial join to the GlacierOutlines geometries.
+
+        :param rgi_dir: The path to the directory where the RGI files or folders are stored.
+        :param rgi_reg: The RGI region name (e.g., RGI2000-v7.0-G-01_alaska) or number (e.g., 1 for region 01)
+        :param version: The RGI version (v7.0 or v6.0)
+        :param inplace: Whether to do the spatial join in-place, or create a new GlacierOutlines object.
+        :param kwargs: additional keyword arguments to pass to gpd.GeoDataFrame.sjoin
+        :return:
+        """
+        fn_rgi = utils.rgi_loader(rgi_dir, rgi_reg=rgi_reg, version=version)
+        return self.join_other(fn_rgi, inplace=inplace, **kwargs)
+
+    def reindex(self, prefix: Union[None, str] = None) -> None:
+        """
+        Re-index the GlacierOutlines.
+
+        :param prefix: a prefix to add to the index (e.g., "RGI60-01" or "LIA-01"). If not provided, defaults to the
+           row number of the GeoDataFrame.
+        """
+        if prefix is None:
+            self.ds.index = range(len(self.ds))
+        else:
+            ndigits = len(str(len(self.ds)))
+            self.ds.index = [f"{prefix}.{str(n+1).zfill(ndigits)}" for n in range(len(self.ds))]
+
+    def compute_area_change(self,
+                            other: Union[GlacierOutlinesType, str, Path],
+                            crs = None,
+                            other_id: str = 'rgi_id',
+                            sign: str = 'neg') -> GlacierOutlinesType:
+        """
+        Compute the area change between this set of outlines and another set of outlines.
+
+        Returns a GlacierOutlines with the following columns:
+
+        - area: the area of the outline, in the specified CRS (or the estimated UTM CRS for the current outlines)
+        - other_area: the area of all outlines in other whose representative point falls within the outline
+        - area_change: the difference between area and other_area (i.e., the change), multiplied by {sign}
+        - num_other: the number of other outlines whose representative point falls within the outline
+        - other_ids: the ids for the other outlines whose representative point falls within the outline
+        - geometry: the outline of this
+
+
+        :param other: the other outlines, or the filename for the other vector file.
+        :param crs: the CRS to use for computing areas. If not set, defaults to .estimate_utm_crs(), which may not be
+            the best choice.
+        :param other_id: the ID column for the other outlines (e.g., 'rgi_id')
+        :param sign: the sign for calculating change, either 'pos' (positive) or 'neg' (negative). Negative implies
+            (other - self) - in other words, other represents outlines from a later point in time. Positive implies
+            (self - other) - in other words, other represents outlines from an earlier point in time.
+        :return: the outlines, with columns as specified above.
+        """
+        assert sign in ['pos', 'neg'], "sign must be one of ['pos', 'neg']"
+
+        if isinstance(other, (str, Path)):
+            other = GlacierOutlines(other)
+
+        if crs is not None:
+            other['new_area'] = other.to_crs(crs).geometry.area / 1e6
+        elif other.crs.is_projected:
+            other['new_area'] = other.geometry.area / 1e6
+        else:
+            UserWarning("CRS has not been set; defaulting to using .estimate_utm_crs() for calculation. "
+                        "Results may not be ideal.")
+            other['new_area'] = other.to_crs(self.estimate_utm_crs()).geometry.area / 1e6
+
+        joined = self.join_other(other, inplace=False)
+
+        joined['other_inds'] = joined.ds.groupby(level=0)[other_id].transform(lambda x: ','.join(x)).drop_duplicates()
+        # get total RGI area for all glaciers within the LIA outline
+        joined['other_area'] = joined.ds.groupby(level=0)['new_area'].sum()
+
+        # count how many other glaciers are included in each outline
+        joined['num_other'] = joined.ds.index.value_counts()
+
+        # for now, defaulting to using Alaska Albers to compute area; easily changed
+        if crs is not None:
+            joined['area'] = joined.to_crs(crs).geometry.area / 1e6
+        else:
+            UserWarning("CRS has not been set; defaulting to using .estimate_utm_crs() for calculation. "
+                        "Results may not be ideal.")
+            joined['area'] = joined.to_crs(joined.estimate_utm_crs()).geometry.area / 1e6
+
+        # calculate difference between LIA area and RGI area
+        if sign == 'neg':
+            joined['area_change'] = joined['other_area'] - joined['area']
+        else:
+            joined['area_change'] = joined['area'] - joined['other_area']
+
+        out_cols = ['area', 'other_area', 'area_change', 'num_other', 'other_inds', 'geometry']
+
+        return joined[~joined.index.duplicated(keep='first')][out_cols]
+
+    def compute_rgi_area_change(self,
+                                rgi_reg: Union[int, str, Path],
+                                rgi_dir: Union[str, Path] = 'rgi',
+                                version: str = 'v7.0',
+                                crs = None,
+                                sign: str = 'neg') -> GlacierOutlinesType:
+        """
+        Compute the area change between this set of outlines and the RGI.
+
+        Returns a GlacierOutlines with the following columns:
+
+        - area: the area of the outline, in the specified CRS (or the estimated UTM CRS for the current outlines)
+        - other_area: the area of all RGI outlines whose representative point falls within the outline
+        - area_change: the difference between area and other_area (i.e., the change), multiplied by {sign}
+        - num_other: the number of RGI outlines whose representative point falls within the outline
+        - other_ids: the ids for the RGI outlines whose representative point falls within the outline
+        - geometry: the outline from this set of outlines.
+
+        :param rgi_reg: The RGI region name (e.g., RGI2000-v7.0-G-01_alaska) or number (e.g., 1 for region 01)
+        :param rgi_dir: The path to the directory where the RGI files or folders are stored.
+        :param version: The RGI version (v7.0 or v6.0)
+        :param crs: the CRS to use for computing areas. If not set, defaults to .estimate_utm_crs(), which may not be
+            the best choice.
+        :param sign: the sign for calculating change, either 'pos' (positive) or 'neg' (negative). Negative implies
+            (other - self) - in other words, other represents outlines from a later point in time. Positive implies
+            (self - other) - in other words, other represents outlines from an earlier point in time.
+        :return: the outlines, with columns as specified above.
+        """
+        id_names = {'v7.0': 'rgi_id',
+                    'v6.0': 'RGIId'}
+
+        fn_rgi = utils.rgi_loader(rgi_dir, rgi_reg=rgi_reg, version=version)
+
+        return self.compute_area_change(fn_rgi, crs=crs, other_id=id_names[version], sign=sign)
