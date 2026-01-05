@@ -1,17 +1,17 @@
-# glacier change mapping tools
+# glacier change mapping tools (glacmaptools)
 
 ## installing
 
 After cloning the repository, navigate to the parent folder of the repository and run the following:
 
 ```bash
-pip install gcmt
+pip install glacmaptools
 ```
 
 Alternatively, install a 'development' version:
 
 ```bash
-pip install -e gcmt
+pip install -e glacmaptools
 ```
 
 You can also use `conda` to create a new environment with the necessary dependencies,
@@ -23,7 +23,7 @@ The `GlacierOutlines` class is based on [geoutils.Vector](https://geoutils.readt
 and is created in the same way:
 
 ```python
-from gcmt.geometry import GlacierOutlines
+from glacmaptools.geometry import GlacierOutlines
 
 outlines = GlacierOutlines('sample_outlnes.gpkg')
 ```
@@ -139,7 +139,7 @@ change = sample.compute_rgi_area_change(rgi_reg=1,
 The `utils` module can also be used to load RGI shapefiles directly:
 
 ```python
-from gcmt import utils
+from glacmaptools import utils
 
 utils.rgi_loader(path_to_rgi, rgi_reg=1, version='v7.0')
 ```
