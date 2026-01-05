@@ -148,7 +148,7 @@ class GlacierOutlines(gu.Vector):
 
         return overlap_inds
 
-    def compute_difference(self, other: Union[GlacierOutlinesType, str, Path],
+    def labeled_difference(self, other: Union[GlacierOutlinesType, str, Path],
                            filter: bool = True) -> GlacierOutlinesType:
         """
         Compute the symmetric difference between the glacier outlines and another geometry, using the .union_all() of
