@@ -12,7 +12,6 @@ GlacierOutlinesType = TypeVar("GlacierOutlinesType", bound="GlacierOutlines")
 
 class GlacierOutlines(gu.Vector):
     """
-
     A vector geometry representing glacier outlines, based on geoutils.Vector.
 
     Main attributes:
@@ -27,7 +26,8 @@ class GlacierOutlines(gu.Vector):
 
        validate(): check whether the outlines have topological or other errors.
        get_overlaps(): return a Vector object with all areas where outlines overlap.
-       join_rgi(): join the outlines to RGI outlines
+       join_other(): spatially join the outlines to another set of outlines
+       join_rgi(): spatially join the outlines to RGI outlines
     """
     def __init__(self, *args, **kwargs):
         gu.Vector.__init__(self, *args, **kwargs)
@@ -170,11 +170,40 @@ class GlacierOutlines(gu.Vector):
 
         return gu.Vector(pd.concat([added.ds, removed.ds], ignore_index=True))
 
+    def join_other(self,
+                   other: Union[GlacierOutlinesType, str, Path],
+                   inplace: bool = False,
+                   **kwargs) -> Union[None, GlacierOutlinesType]:
+
+        """
+        Join the GlacierOutlines to overlapping outlines. Other outlines are first sub-sampled by intersecting with
+        the total boundary of the GlacierOutlines geometries. The sub-sampled other outlines are then converted to a
+        "representative point" before applying a spatial join to the GlacierOutlines geometries.
+
+        :param other: the other outlines, or the filename for the other vector file
+        :param inplace: Whether to do the spatial join in-place, or create a new GlacierOutlines object.
+        :param kwargs: additional keyword arguments to pass to gpd.GeoDataFrame.sjoin
+        :return:
+        """
+        if isinstance(other, (str, Path)):
+            other = GlacierOutlines(other)
+
+        envelope = self.union_all().envelope.ds.loc[0, 'geometry']
+        reduced = other[other.ds.to_crs(self.crs).intersects(envelope)].copy().ds
+        reduced['geometry'] = reduced.to_crs(self.estimate_utm_crs()).representative_point().to_crs(self.crs)
+
+        if inplace:
+            self.ds = self.sjoin(reduced, **kwargs).ds
+            return None
+        else:
+            return self.sjoin(reduced, **kwargs)
+
     def join_rgi(self,
                  rgi_reg: Union[int, str, Path],
                  rgi_dir: Union[str, Path] = 'rgi',
                  version: str = 'v7.0',
-                 inplace: bool = False) -> Union[None, GlacierOutlinesType]:
+                 inplace: bool = False,
+                 **kwargs) -> Union[None, GlacierOutlinesType]:
         """
         Join the GlacierOutlines to overlapping RGI outlines. RGI outlines are first sub-sampled by intersecting with
         the total boundary of the GlacierOutlines geometries. The sub-sampled RGI outlines are then converted to a
@@ -184,21 +213,11 @@ class GlacierOutlines(gu.Vector):
         :param rgi_reg: The RGI region name (e.g., RGI2000-v7.0-G-01_alaska) or number (e.g., 1 for region 01)
         :param version: The RGI version (v7.0 or v6.0)
         :param inplace: Whether to do the spatial join in-place, or create a new GlacierOutlines object.
+        :param kwargs: additional keyword arguments to pass to gpd.GeoDataFrame.sjoin
         :return:
         """
-        rgi_outlines = gu.Vector(utils.rgi_loader(rgi_dir, rgi_reg=rgi_reg, version=version))
-        envelope = self.union_all().envelope.ds.loc[0, 'geometry']
-
-        reduced = rgi_outlines[rgi_outlines.ds.to_crs(self.crs).intersects(envelope)].copy().ds
-        reduced['geometry'] = reduced.to_crs(self.estimate_utm_crs()).representative_point().to_crs(self.crs)
-
-        rgi_centers = gu.Vector(reduced)
-
-        if inplace:
-            self.ds = self.sjoin(rgi_centers).ds
-            return None
-        else:
-            return self.sjoin(rgi_centers)
+        fn_rgi = utils.rgi_loader(rgi_dir, rgi_reg=rgi_reg, version=version)
+        return self.join_other(fn_rgi, inplace=inplace, **kwargs)
 
     def reindex(self, prefix: Union[None, str] = None) -> None:
         """
