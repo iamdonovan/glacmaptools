@@ -250,45 +250,105 @@ class GlacierOutlines(gu.Vector):
             ndigits = len(str(len(self.ds)))
             self.ds.index = [f"{prefix}.{str(n+1).zfill(ndigits)}" for n in range(len(self.ds))]
 
-    def compute_area_changes(self,
-                             other,
-                             crs = None) -> GlacierOutlinesType:
+    def compute_area_change(self,
+                            other: Union[GlacierOutlinesType, str, Path],
+                            crs = None,
+                            other_id: str = 'rgi_id',
+                            sign: str = 'neg') -> GlacierOutlinesType:
         """
+        Compute the area change between this set of outlines and another set of outlines.
 
-        :param other:
-        :param crs:
-        :return:
+        Returns a GlacierOutlines with the following columns:
+
+        - area: the area of the outline, in the specified CRS (or the estimated UTM CRS for the current outlines)
+        - other_area: the area of all outlines in other whose representative point falls within the outline
+        - area_change: the difference between area and other_area (i.e., the change), multiplied by {sign}
+        - num_other: the number of other outlines whose representative point falls within the outline
+        - other_ids: the ids for the other outlines whose representative point falls within the outline
+        - geometry: the outline of this
+
+
+        :param other: the other outlines, or the filename for the other vector file.
+        :param crs: the CRS to use for computing areas. If not set, defaults to .estimate_utm_crs(), which may not be
+            the best choice.
+        :param other_id: the ID column for the other outlines (e.g., 'rgi_id')
+        :param sign: the sign for calculating change, either 'pos' (positive) or 'neg' (negative). Negative implies
+            (other - self) - in other words, other represents outlines from a later point in time. Positive implies
+            (self - other) - in other words, other represents outlines from an earlier point in time.
+        :return: the outlines, with columns as specified above.
         """
+        assert sign in ['pos', 'neg'], "sign must be one of ['pos', 'neg']"
+
         if isinstance(other, (str, Path)):
             other = GlacierOutlines(other)
 
+        if crs is not None:
+            other['new_area'] = other.to_crs(crs).geometry.area / 1e6
+        elif other.crs.is_projected:
+            other['new_area'] = other.geometry.area / 1e6
+        else:
+            UserWarning("CRS has not been set; defaulting to using .estimate_utm_crs() for calculation. "
+                        "Results may not be ideal.")
+            other['new_area'] = other.to_crs(self.estimate_utm_crs()).geometry.area / 1e6
+
         joined = self.join_other(other, inplace=False)
 
-        colnames = {'v7.0': {'id': 'rgi_id', 'area': 'area_km2'},
-                    'v6.0': {'id': 'RGIId', 'area': 'Area'}}
-
-        joined['rgi_inds'] = joined.ds.groupby(level=0)[colnames[version]['id']].transform(lambda x: ','.join(x)).drop_duplicates()
+        joined['other_inds'] = joined.ds.groupby(level=0)[other_id].transform(lambda x: ','.join(x)).drop_duplicates()
         # get total RGI area for all glaciers within the LIA outline
-        joined['rgi_area'] = joined.ds.groupby(level=0)[colnames[version]['area']].sum()
+        joined['other_area'] = joined.ds.groupby(level=0)['new_area'].sum()
 
-        # count how many RGI glaciers are included in each LIA outline
-        joined['n_rgi'] = joined.ds.index.value_counts()
+        # count how many other glaciers are included in each outline
+        joined['num_other'] = joined.ds.index.value_counts()
 
         # for now, defaulting to using Alaska Albers to compute area; easily changed
         if crs is not None:
-            joined['lia_area'] = joined.to_crs(crs).geometry.area / 1e6
+            joined['area'] = joined.to_crs(crs).geometry.area / 1e6
         else:
-            joined['lia_area'] = joined.to_crs(joined.estimate_utm_crs()).geometry.area / 1e6
+            UserWarning("CRS has not been set; defaulting to using .estimate_utm_crs() for calculation. "
+                        "Results may not be ideal.")
+            joined['area'] = joined.to_crs(joined.estimate_utm_crs()).geometry.area / 1e6
 
         # calculate difference between LIA area and RGI area
-        joined['lia_rgi_diff'] = joined['lia_area'] - joined['rgi_area']
+        if sign == 'neg':
+            joined['area_change'] = joined['other_area'] - joined['area']
+        else:
+            joined['area_change'] = joined['area'] - joined['other_area']
 
-        out_cols = ['self_area', 'other_area', 'difference', 'n_other', 'other_inds', 'geometry']
+        out_cols = ['area', 'other_area', 'area_change', 'num_other', 'other_inds', 'geometry']
 
         return joined[~joined.index.duplicated(keep='first')][out_cols]
 
-    def compute_rgi_area_changes(self,
-                                 rgi_reg: Union[int, str, Path],
-                                 rgi_dir: Union[str, Path] = 'rgi',
-                                 version: str = 'v7.0'):
-        pass
+    def compute_rgi_area_change(self,
+                                rgi_reg: Union[int, str, Path],
+                                rgi_dir: Union[str, Path] = 'rgi',
+                                version: str = 'v7.0',
+                                crs = None,
+                                sign: str = 'neg') -> GlacierOutlinesType:
+        """
+        Compute the area change between this set of outlines and the RGI.
+
+        Returns a GlacierOutlines with the following columns:
+
+        - area: the area of the outline, in the specified CRS (or the estimated UTM CRS for the current outlines)
+        - other_area: the area of all RGI outlines whose representative point falls within the outline
+        - area_change: the difference between area and other_area (i.e., the change), multiplied by {sign}
+        - num_other: the number of RGI outlines whose representative point falls within the outline
+        - other_ids: the ids for the RGI outlines whose representative point falls within the outline
+        - geometry: the outline from this set of outlines.
+
+        :param rgi_reg: The RGI region name (e.g., RGI2000-v7.0-G-01_alaska) or number (e.g., 1 for region 01)
+        :param rgi_dir: The path to the directory where the RGI files or folders are stored.
+        :param version: The RGI version (v7.0 or v6.0)
+        :param crs: the CRS to use for computing areas. If not set, defaults to .estimate_utm_crs(), which may not be
+            the best choice.
+        :param sign: the sign for calculating change, either 'pos' (positive) or 'neg' (negative). Negative implies
+            (other - self) - in other words, other represents outlines from a later point in time. Positive implies
+            (self - other) - in other words, other represents outlines from an earlier point in time.
+        :return: the outlines, with columns as specified above.
+        """
+        id_names = {'v7.0': 'rgi_id',
+                    'v6.0': 'RGIId'}
+
+        fn_rgi = utils.rgi_loader(rgi_dir, rgi_reg=rgi_reg, version=version)
+
+        return self.compute_area_change(fn_rgi, crs=crs, other_id=id_names[version], sign=sign)
