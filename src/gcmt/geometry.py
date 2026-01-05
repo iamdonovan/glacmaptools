@@ -207,7 +207,8 @@ class GlacierOutlines(gu.Vector):
             other = GlacierOutlines(other)
 
         reduced = self.filter_other(other)
-        reduced['geometry'] = reduced.to_crs(self.estimate_utm_crs()).representative_point().to_crs(self.crs)
+        new_pts = reduced.to_crs(self.estimate_utm_crs()).representative_point().to_crs(self.crs).ds['geometry']
+        reduced['geometry'] = new_pts
 
         if inplace:
             self.ds = self.sjoin(reduced, **kwargs).ds
@@ -248,7 +249,6 @@ class GlacierOutlines(gu.Vector):
         else:
             ndigits = len(str(len(self.ds)))
             self.ds.index = [f"{prefix}.{str(n+1).zfill(ndigits)}" for n in range(len(self.ds))]
-
 
     def compute_area_changes(self,
                              other,
